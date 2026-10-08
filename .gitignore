@@ -1,0 +1,6 @@
+﻿bin/
+core/target/
+node_modules/
+*.zip
+DroplineDownloads/
+.dropline/

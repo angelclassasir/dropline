@@ -1,0 +1,13 @@
+[package]
+name = "dropline"
+version = "0.2.0"
+description = "Dropline core: headless video fetcher bridge for After Effects"
+authors = ["ZapNap"]
+edition = "2021"
+
+[dependencies]
+serde_json = "1"
+dirs = "6.0"
+
+[profile.release]
+strip = true
