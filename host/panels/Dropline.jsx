@@ -1,14 +1,38 @@
-// Dropline v7 - beauty pass: green step completion, cards, Segoe UI/Consolas
-// ES3 polyfill: ExtendScript has no String.trim (ES5)
+// Dropline v1.5 - flight recorder log + stall breaker + no blind ffmpeg kill
 if (!String.prototype.trim) {
     String.prototype.trim = function () { return String(this).replace(/^\s+/, "").replace(/\s+$/, ""); };
 }
 
 (function (thisObj) {
-    var CFG = {
-        exe: "C:\\Users\\angel\\.proyectos-photoshop\\dropline\\bin\\dropline-core.exe",
-        bridge: "C:/Users/angel/DroplineDownloads"
-    };
+    var HOME = Folder.userData.parent.parent.fsName;
+
+    var CFG = (function () {
+        var exe = "";
+        var bridge = HOME + "/DroplineDownloads";
+        var cfgFile = new File(HOME + "/.dropline/config.json");
+        if (cfgFile.exists) {
+            try {
+                cfgFile.open("r");
+                var data = eval("(" + cfgFile.read() + ")");
+                cfgFile.close();
+                if (data.coreExe) exe = String(data.coreExe).replace(/\\/g, "/");
+                if (data.bridge) bridge = String(data.bridge).replace(/\\/g, "/");
+            } catch (e) {}
+        }
+        return { exe: exe, bridge: bridge, configured: exe !== "" };
+    })();
+
+    // ===== FLIGHT RECORDER: every phase gets logged =====
+    function log(msg) {
+        try {
+            var dir = new Folder(HOME + "/.dropline");
+            if (!dir.exists) dir.create();
+            var f = new File(HOME + "/.dropline/dropline.log");
+            f.open("a");
+            f.writeln(new Date().toString() + " | " + msg);
+            f.close();
+        } catch (e) {}
+    }
 
     var C = {
         bg:      [0.08, 0.08, 0.10, 1],
@@ -28,7 +52,6 @@ if (!String.prototype.trim) {
     pal.margins = 16;
     try { pal.graphics.backgroundColor = pal.graphics.newBrush(pal.graphics.BrushType.SOLID_COLOR, C.bg); } catch (e) {}
 
-    // Pen cache: pens created ONCE per control (no GDI leak)
     function paint(ctrl, colorName, font) {
         try {
             if (font && !ctrl._fontSet) { ctrl.graphics.font = font; ctrl._fontSet = true; }
@@ -43,7 +66,6 @@ if (!String.prototype.trim) {
         try { ctrl.graphics.backgroundColor = ctrl.graphics.newBrush(ctrl.graphics.BrushType.SOLID_COLOR, C[colorName]); } catch (e) {}
     }
 
-    // ============ HEADER ============
     var header = pal.add("group");
     header.orientation = "column";
     header.alignChildren = ["fill", "top"];
@@ -56,7 +78,6 @@ if (!String.prototype.trim) {
     var subtitle = header.add("statictext", undefined, "drop videos straight into your timeline");
     paint(subtitle, "muted", "italic 10px Segoe UI");
 
-    // ============ INPUT CARD ============
     var card = pal.add("group");
     card.orientation = "column";
     card.alignChildren = ["fill", "top"];
@@ -86,7 +107,9 @@ if (!String.prototype.trim) {
     outInput.preferredSize.height = 24;
     surface(outInput, "field");
 
-    // ============ STEPS (equal columns, light up green on completion) ============
+    var audioCheck = card.add("checkbox", undefined, "AUDIO ONLY (extract .m4a)");
+    paint(audioCheck, "text", "10px Segoe UI");
+
     var stepsRow = pal.add("group");
     stepsRow.orientation = "row";
     stepsRow.alignChildren = ["fill", "top"];
@@ -108,7 +131,6 @@ if (!String.prototype.trim) {
     function paintStep(s, color) { paint(s.n, color, "bold 14px Segoe UI"); paint(s.l, color, "9px Segoe UI"); }
     function resetSteps() { paintStep(s1, "muted"); paintStep(s2, "muted"); paintStep(s3, "muted"); }
 
-    // ============ CONSOLE CARD (progress + status) ============
     var consoleCard = pal.add("group");
     consoleCard.orientation = "column";
     consoleCard.alignChildren = ["fill", "top"];
@@ -124,15 +146,13 @@ if (!String.prototype.trim) {
         paint(statusText, color || "text", "10px Segoe UI");
     }
 
-    // ============ FOOTER (single clean tech line) ============
-    var dbg = pal.add("statictext", undefined, "dropline v0.7");
+    var dbg = pal.add("statictext", undefined, "dropline v1.0");
     paint(dbg, "muted", "8px Consolas");
     function setDebug(msg, color) {
         dbg.text = msg;
         paint(dbg, color || "muted", "8px Consolas");
     }
 
-    // ============ BUTTONS ============
     var dropBtn = pal.add("button", undefined, "D R O P   I T");
     dropBtn.preferredSize.height = 40;
     var updateBtn = pal.add("button", undefined, "update engine (yt-dlp)");
@@ -149,19 +169,34 @@ if (!String.prototype.trim) {
         return out;
     }
 
-    function clearBridge() {
+    // Cleanup WITHOUT blind ffmpeg kill (that could leave half-locked files)
+    function aggressiveCleanup() {
         try {
-            var old = new File(CFG.bridge + "/status.json");
-            if (old.exists) old.remove();
-            var proof = new File(CFG.bridge + "/callproof.txt");
-            if (proof.exists) proof.remove();
+            system.callSystem('cmd /c taskkill /im dropline-core.exe /f >nul 2>&1');
+            system.callSystem('cmd /c taskkill /im yt-dlp.exe /f >nul 2>&1');
+        } catch (e) {}
+        $.sleep(400);
+        try {
+            var statusFile = new File(CFG.bridge + "/status.json");
+            if (statusFile.exists) statusFile.remove();
+            var proofFile = new File(CFG.bridge + "/callproof.txt");
+            if (proofFile.exists) proofFile.remove();
+            // Clean up old .part files to avoid confusion
+            var bridgeFolder = new Folder(CFG.bridge);
+            if (bridgeFolder.exists) {
+                var partFiles = bridgeFolder.getFiles("*.part");
+                for (var i = 0; i < partFiles.length; i++) {
+                    try { partFiles[i].remove(); } catch (e) {}
+                }
+            }
         } catch (e) {}
     }
 
+
     function cmdSafe(s) { return String(s).replace(/([&|<>^])/g, "^$1"); }
 
-    // ZERO double quotes: callSystem quote-wrapping mutilates quoted payloads
     function buildCmd(argArray) {
+        // start is a cmd builtin: the cmd /c wrapper is mandatory
         var line = 'cmd /c start /min ' + CFG.exe;
         for (var i = 0; i < argArray.length; i++) {
             line += ' ' + cmdSafe(argArray[i]);
@@ -191,6 +226,8 @@ if (!String.prototype.trim) {
 
         var startTime = new Date().getTime();
         var proofChecked = false;
+        var lastPct = -1;
+        var lastMove = startTime;
         while (true) {
             $.sleep(500);
             var now = new Date().getTime();
@@ -202,18 +239,18 @@ if (!String.prototype.trim) {
                     var proof = new File(CFG.bridge + "/callproof.txt");
                     if (!proof.exists) {
                         w.close();
-                        setStatus("callSystem executes nothing here", "err");
-                        setDebug("debug: callSystem dead in this AE build", "err");
-                        unlock();
-                        return;
+                        $.sleep(300);
+                        log("FAIL: callSystem dead (no proof file)");
+                        aggressiveCleanup();
+                        return { error: "callSystem executes nothing here" };
                     }
                 }
                 if (now - startTime > 15000) {
                     w.close();
-                    setStatus("core did not start - see footer", "err");
-                    setDebug("cmd -> " + lastCmd, "err");
-                    unlock();
-                    return;
+                    $.sleep(300);
+                    log("FAIL: core did not start within 15s");
+                    aggressiveCleanup();
+                    return { error: "core did not start - see footer", cmd: lastCmd };
                 }
                 t.text = "starting core...";
                 w.update();
@@ -221,19 +258,44 @@ if (!String.prototype.trim) {
             }
 
             var txt = "";
-            f.open("r"); txt = f.read(); f.close();
             var data = null;
-            try { data = eval("(" + txt + ")"); } catch (e) { data = null; }
+            var retries = 0;
+            while (retries < 3) {
+                try {
+                    f.open("r");
+                    txt = f.read();
+                    f.close();
+                    data = eval("(" + txt + ")");
+                    if (data && data.state) break;  // Success
+                } catch (e) {
+                    try { f.close(); } catch (e2) {}
+                    retries++;
+                    if (retries < 3) $.sleep(300);  // Wait before retry
+                }
+            }
             if (!data || !data.state) { w.update(); continue; }
 
             if (data.state === "starting" || data.state === "downloading") {
                 var pct = Math.floor(data.percent || 0);
+                // STALL BREAKER: no progress for 3 min -> clean error instead of infinite hang
+                if (pct !== lastPct) {
+                    lastPct = pct;
+                    lastMove = now;
+                } else if (now - lastMove > 180000) {
+                    w.close();
+                    $.sleep(300);
+                    log("STALL: stuck at " + pct + "% for 180s");
+                    aggressiveCleanup();
+                    return { error: "download stalled at " + pct + "% (log saved)" };
+                }
+                log("tick " + data.state + " " + pct + "%");
                 bar.text = blocks(pct) + "  " + pct + "%";
                 progressText.text = bar.text;
                 paint(progressText, "accent", "12px Consolas");
                 t.text = "01 FETCH - downloading " + pct + "%";
                 paintStep(s1, "accent");
             } else if (data.state === "encoding") {
+                log("tick encoding");
                 bar.text = blocks(100) + "  merge";
                 progressText.text = bar.text;
                 paint(progressText, "accent", "12px Consolas");
@@ -243,6 +305,7 @@ if (!String.prototype.trim) {
             } else if (data.state === "updating") {
                 t.text = "updating yt-dlp engine...";
             } else if (data.state === "done") {
+                log("DONE file=" + (data.file || "none"));
                 bar.text = blocks(100) + "  100%";
                 progressText.text = bar.text;
                 paint(progressText, "ok", "12px Consolas");
@@ -251,37 +314,32 @@ if (!String.prototype.trim) {
                 paintStep(s3, "accent");
                 t.text = "03 TIMELINE - importing...";
                 w.update();
-                if (updating) {
-                    setStatus("engine updated: " + (data.message || "ok"), "ok");
-                } else if (data.file) {
-                    autoImport(data.file);
-                } else {
-                    setStatus("done but no file reported", "err");
-                }
+                var result = { file: data.file || null };
                 try { f.remove(); } catch (e) {}
-                $.sleep(700);
                 w.close();
-                unlock();
-                return;
+                $.sleep(400);
+                aggressiveCleanup();
+                return result;
             } else if (data.state === "error") {
+                log("CORE ERROR: " + (data.message || "unknown"));
                 t.text = "ERROR";
                 bar.text = String(data.message || "unknown").slice(0, 60);
                 w.update();
-                $.sleep(4000);
-                w.close();
-                setStatus("error: " + (data.message || "unknown"), "err");
-                setDebug("cmd -> " + lastCmd, "err");
-                resetSteps();
+                $.sleep(3000);
+                var errorMsg = data.message || "unknown";
                 try { f.remove(); } catch (e) {}
-                unlock();
-                return;
+                w.close();
+                $.sleep(400);
+                aggressiveCleanup();
+                return { error: errorMsg };
             }
 
             if (now - startTime > 600000) {
                 w.close();
-                setStatus("timeout after 10 min", "err");
-                unlock();
-                return;
+                $.sleep(400);
+                log("TIMEOUT 10min");
+                aggressiveCleanup();
+                return { error: "timeout after 10 min" };
             }
             w.update();
         }
@@ -289,22 +347,36 @@ if (!String.prototype.trim) {
 
     function autoImport(filePath) {
         var videoFile = new File(filePath);
-        if (!videoFile.exists) { setStatus("file not found: " + filePath, "err"); return; }
+        if (!videoFile.exists) { setStatus("file not found: " + filePath, "err"); log("IMPORT FAIL: missing " + filePath); return; }
+        var prev = -1;
+        for (var k = 0; k < 10; k++) {
+            var cur = videoFile.length;
+            if (cur > 0 && cur === prev) break;
+            prev = cur;
+            $.sleep(400);
+        }
+        if (prev <= 0) { setStatus("downloaded file is empty", "err"); paintStep(s3, "err"); log("IMPORT FAIL: empty file"); return; }
         var comp = app.project.activeItem;
         if (!(comp instanceof CompItem)) {
             setStatus("select a composition first", "err");
             paintStep(s3, "err");
+            log("IMPORT FAIL: no active comp");
             return;
         }
+        log("IMPORT START " + filePath + " size=" + prev);
         try {
-            var item = app.project.importFile(new ImportOptions(videoFile));
+            var io = new ImportOptions(videoFile);
+            io.importAs = ImportAsType.FOOTAGE;
+            var item = app.project.importFile(io);
             var layer = comp.layers.add(item);
             layer.startTime = comp.time;
             setStatus("imported: " + videoFile.displayName, "ok");
             paintStep(s3, "ok");
+            log("IMPORT OK " + videoFile.displayName);
         } catch (e) {
             setStatus("import failed: " + e.toString(), "err");
             paintStep(s3, "err");
+            log("IMPORT EXCEPTION " + e.toString());
         }
     }
 
@@ -313,7 +385,7 @@ if (!String.prototype.trim) {
         var url = urlInput.text.trim();
         url = url.replace(/"/g, "");
         if (!url) { setStatus("paste a URL first", "err"); return; }
-        if (!(new File(CFG.exe)).exists) { setStatus("core exe missing!", "err"); setDebug("debug: exe NOT found", "err"); return; }
+        if (!CFG.configured || !(new File(CFG.exe)).exists) { setStatus("run scripts/install.ps1 first", "err"); setDebug("config missing: ~/.dropline/config.json", "err"); return; }
 
         busy = true;
         dropBtn.enabled = false;
@@ -322,42 +394,66 @@ if (!String.prototype.trim) {
         paintStep(s1, "accent");
         progressText.text = blocks(0) + "  0%";
         paint(progressText, "accent", "12px Consolas");
-        clearBridge();
+        aggressiveCleanup();
 
         var argArray = ["cli", "--url", url];
         var a = inInput.text.trim();
         var b = outInput.text.trim();
         if (a && b) { argArray.push("--start"); argArray.push(a); argArray.push("--end"); argArray.push(b); }
+        if (audioCheck.value) { argArray.push("--audio-only"); }
         lastCmd = buildCmd(argArray);
         setDebug("launching core...", "muted");
+        log("LAUNCH trim=" + (a && b ? a + "-" + b : "no") + " cmd=" + lastCmd);
 
-        // Probe: does callSystem execute anything at all inside this AE?
         try {
             system.callSystem('cmd /c echo ok> ' + CFG.bridge.replace(/\//g, "\\") + '\\callproof.txt');
         } catch (e) {}
         system.callSystem(lastCmd);
         setStatus("working...", "text");
-        runModal();
+
+        var result = runModal();
+        log("MODAL RETURNED error=" + (result.error || "none") + " file=" + (result.file || "none"));
+
+        if (result.error) {
+            setStatus("error: " + result.error, "err");
+            if (result.cmd) setDebug("cmd -> " + result.cmd, "err");
+            resetSteps();
+        } else if (result.file) {
+            if (updating) {
+                setStatus("engine updated", "ok");
+            } else {
+                autoImport(result.file);
+            }
+        }
+        unlock();
     }
 
     function launchUpdate() {
         if (busy) return;
-        if (!(new File(CFG.exe)).exists) { setStatus("core exe missing!", "err"); return; }
+        if (!CFG.configured || !(new File(CFG.exe)).exists) { setStatus("run scripts/install.ps1 first", "err"); return; }
         busy = true;
         updating = true;
         dropBtn.enabled = false;
         updateBtn.enabled = false;
-        clearBridge();
+        aggressiveCleanup();
         lastCmd = buildCmd(["update"]);
+        log("LAUNCH UPDATE");
         system.callSystem(lastCmd);
-        runModal();
+        var result = runModal();
+        if (result.error) {
+            setStatus("update error: " + result.error, "err");
+        } else {
+            setStatus("engine updated", "ok");
+        }
+        unlock();
     }
 
-    // Exceptions are ALWAYS visible, with line number
     dropBtn.onClick = function () {
         try { launch(); } catch (e) {
             setStatus("handler error: " + e.toString(), "err");
             setDebug("line " + e.line + " -> " + e.toString(), "err");
+            log("HANDLER EXCEPTION line " + e.line + " " + e.toString());
+            aggressiveCleanup();
             unlock();
         }
     };
@@ -365,11 +461,14 @@ if (!String.prototype.trim) {
         try { launchUpdate(); } catch (e) {
             setStatus("handler error: " + e.toString(), "err");
             setDebug("line " + e.line + " -> " + e.toString(), "err");
+            log("UPDATE HANDLER EXCEPTION " + e.toString());
+            aggressiveCleanup();
             unlock();
         }
     };
 
-    setDebug("core " + ((new File(CFG.exe)).exists ? "OK" : "MISSING") + " · dropline v0.7", "muted");
+    setDebug((CFG.configured ? "core OK" : "run install.ps1") + " · dropline v1.0", "muted");
+    log("PANEL LOADED v1.5");
 
     if (pal instanceof Window) {
         pal.center();

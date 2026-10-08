@@ -99,6 +99,9 @@ fn run_cli(args: &[String]) -> i32 {
     if !start.is_empty() && !end.is_empty() {
         cmd.arg("--download-sections").arg(format!("*{}-{}", start, end));
         cmd.arg("--force-keyframes-at-cuts");
+        // Guarantee AE-friendly codecs after the cut re-encode
+        cmd.arg("--postprocessor-args")
+           .arg("ffmpeg:-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -c:a aac -b:a 192k");
     }
 
     let mut child = match cmd.spawn() {
