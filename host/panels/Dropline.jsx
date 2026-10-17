@@ -1,15 +1,26 @@
-// Dropline panel v1.0.1 - After Effects ScriptUI panel
+// Dropline panel v1.0.2 - After Effects ScriptUI panel
 //
 // The URL never touches the command line: it travels inside request.json and the
 // core reads it from there, so there is nothing to escape or inject. Progress
-// comes back through status.json (a file bridge, because callSystem blocks).
+// comes back through status.json.
+//
+// Two hard-won rules in here, both learned the hard way:
+//   1. system.callSystem blocks until the process it started finishes, because the
+//      child inherits AE's stdout pipe - `cmd /c start` therefore froze After
+//      Effects for the entire download (and forever when the child outlived the
+//      session). The core is launched with PowerShell's Start-Process instead,
+//      which gives the child fresh handles: callSystem returns in ~2.5s and the
+//      download continues detached, logging to core.log.
+//   2. Polling must never run in a while + $.sleep loop: that owns the app's
+//      thread and freezes the UI. app.scheduleTask() gives the polling back to
+//      After Effects' own event loop, so the app stays responsive.
 
 if (!String.prototype.trim) {
     String.prototype.trim = function () { return String(this).replace(/^\s+/, "").replace(/\s+$/, ""); };
 }
 
 (function (thisObj) {
-    var PANEL_VERSION = "1.0.1";
+    var PANEL_VERSION = "1.0.3";
 
     var HOME = (function () {
         try { return Folder.userData.parent.parent.fsName; } catch (e) {}
@@ -166,6 +177,9 @@ if (!String.prototype.trim) {
         cfg.configured = cfg.exe !== "";
         cfg.request = cfg.bridge + "/request.json";
         cfg.requestWin = cfg.bridgeWin + "\\request.json";
+        cfg.coreLog = cfg.bridge + "/core.log";
+        cfg.coreLogWin = cfg.bridgeWin + "\\core.log";
+        cfg.errLogWin = cfg.bridgeWin + "\\core.err.log";
         return cfg;
     })();
 
@@ -339,9 +353,42 @@ if (!String.prototype.trim) {
         file.close();
     }
 
-    // Only sandboxed filesystem paths go on the shell line; the URL travels in request.json
+    // Only sandboxed filesystem paths go on the shell line; the URL travels in request.json.
+    //
+    // Launching the core is the delicate part. ANY command that lets the child inherit
+    // AE's stdout pipe makes system.callSystem wait for that child, which froze After
+    // Effects for the whole download - and forever if the child outlived the session.
+    // `cmd /c start` always inherits (measured: it blocks). PowerShell's Start-Process
+    // gives the child brand new handles, so callSystem returns in ~2.5s (PowerShell's
+    // own startup) while the core downloads detached; its output lands in core.log.
+    function psQuote(s) {
+        return "'" + String(s).replace(/'/g, "''") + "'";
+    }
+
+    function psLaunch(argumentList) {
+        return 'powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "Start-Process -FilePath ' +
+               psQuote(CFG.exeWin) +
+               ' -ArgumentList ' + argumentList +
+               ' -RedirectStandardOutput ' + psQuote(CFG.coreLogWin) +
+               ' -RedirectStandardError ' + psQuote(CFG.errLogWin) +
+               ' -WindowStyle Hidden"';
+    }
+
     function coreCommand() {
-        return 'cmd /c start "" /min "' + CFG.exeWin + '" cli --request "' + CFG.requestWin + '"';
+        return psLaunch("'cli','--request'," + psQuote(CFG.requestWin));
+    }
+
+    function updateCommand() {
+        return psLaunch("'update'");
+    }
+
+    function dropCoreLog() {
+        try {
+            var old = new File(CFG.coreLog);
+            if (old.exists) old.remove();
+            var oldErr = new File(CFG.errLog);
+            if (oldErr.exists) oldErr.remove();
+        } catch (e) {}
     }
 
     function readStatus() {
@@ -372,130 +419,157 @@ if (!String.prototype.trim) {
         updateBtn.enabled = true;
     }
 
-    function runModal() {
-        var w = new Window("palette", "Dropline working", undefined, { resizeable: false });
-        w.orientation = "column";
-        w.alignChildren = ["fill", "center"];
-        w.margins = 24;
-        w.spacing = 12;
-        var t = w.add("statictext", undefined, "starting core...");
-        t.graphics.font = "bold 12px Segoe UI";
-        var bar = w.add("statictext", undefined, blocks(0) + "  0%");
-        bar.graphics.font = "14px Consolas";
-        w.show();
-        w.update();
+    // ===== non-blocking job watcher =====
+    // Polling used to run inside a `while (true) { $.sleep(500); ... }` loop, which
+    // owns After Effects' only thread: the app froze (and looked crashed) for the
+    // whole download, before the progress window even appeared. app.scheduleTask()
+    // gives the polling back to AE's own event loop, so the app stays alive and the
+    // progress actually reaches the UI - which is what the README always promised.
+    var watch = null;
 
-        var startTime = new Date().getTime();
-        var proofChecked = false;
-        var lastPct = -1;
-        var lastMove = startTime;
-        var lastLogPct = -1;
-        var lastLogState = "";
-        var coreVersion = "";
-
-        function note(state, pct) {
-            if (state !== lastLogState || pct >= lastLogPct + 5) {
-                lastLogState = state;
-                lastLogPct = pct;
-                log("tick " + state + " " + pct + "%");
-            }
+    function startWatch(onDone) {
+        watch = {
+            job: JOB,
+            onDone: onDone,
+            startTime: new Date().getTime(),
+            lastMove: new Date().getTime(),
+            lastPct: -1,
+            lastLogPct: -1,
+            lastLogState: "",
+            coreVersion: "",
+            statusSeen: false,
+            proofChecked: false,
+            taskId: null
+        };
+        $.global.__droplinePoll = watchTick;
+        try {
+            watch.taskId = app.scheduleTask("(typeof __droplinePoll === 'function') && __droplinePoll();", 500, true);
+            log("WATCH STARTED job=" + watch.job + " task=" + watch.taskId);
+        } catch (e) {
+            log("SCHEDULETASK FAILED " + e.toString());
+            var cb = watch.onDone;
+            watch = null;
+            if (cb) cb({ error: "cannot start polling: " + e.toString() });
         }
-        function finish(result) {
-            w.close();
-            $.sleep(300);
-            aggressiveCleanup();
-            return result;
+    }
+
+    function stopWatch() {
+        var w = watch;
+        watch = null;
+        if (w && w.taskId !== null) {
+            try { app.cancelTask(w.taskId); } catch (e) {}
         }
+        try { $.global.__droplinePoll = null; } catch (e2) {}
+        return w;
+    }
 
-        while (true) {
-            $.sleep(500);
-            var now = new Date().getTime();
-            var statusFile = new File(CFG.bridge + "/status.json");
+    function endWatch(result) {
+        var w = stopWatch();
+        log("WATCH ENDED error=" + (result && result.error ? result.error : "none") +
+            " file=" + (result && result.file ? result.file : "none"));
+        aggressiveCleanup();
+        if (w && w.onDone) w.onDone(result);
+    }
 
-            if (!statusFile.exists) {
-                if (now - startTime > 6000 && !proofChecked) {
-                    proofChecked = true;
+    function noteTick(state, pct) {
+        if (state !== watch.lastLogState || pct >= watch.lastLogPct + 5) {
+            watch.lastLogState = state;
+            watch.lastLogPct = pct;
+            log("tick " + state + " " + pct + "%");
+        }
+    }
+
+    // A scheduled task that throws would pop an ExtendScript error dialog, so every
+    // tick is contained here.
+    function watchTick() {
+        if (!watch) return;
+        try {
+            watchTickInner();
+        } catch (e) {
+            log("TICK EXCEPTION " + e.toString() + " line " + (e.line || -1));
+            endWatch({ error: "internal error: " + e.toString() });
+        }
+    }
+
+    function watchTickInner() {
+        var now = new Date().getTime();
+        var data = readStatus();
+
+        if (!data) {
+            if (!watch.statusSeen) {
+                if (!watch.proofChecked && now - watch.startTime > 6000) {
+                    watch.proofChecked = true;
                     var proof = new File(CFG.bridge + "/callproof.txt");
                     if (!proof.exists) {
                         log("FAIL: callSystem dead (no proof file)");
-                        return finish({ error: "callSystem executes nothing here" });
+                        return endWatch({ error: "callSystem executes nothing here" });
                     }
                 }
-                if (now - startTime > 15000) {
-                    log("FAIL: core did not start within 15s");
-                    return finish({ error: "core did not start - see footer", cmd: lastCmd });
+                if (now - watch.startTime > 20000) {
+                    log("FAIL: core did not start within 20s");
+                    return endWatch({ error: "core did not start - see footer", cmd: lastCmd });
                 }
-                t.text = "starting core...";
-                w.update();
-                continue;
             }
+            return;
+        }
 
-            var data = readStatus();
-            if (!data) { w.update(); continue; }
+        // A leftover status file from another job must never drive this run
+        if (watch.job && data.job && data.job !== watch.job) return;
 
-            // A leftover status file from another job must never drive this run
-            if (data.job && JOB && data.job !== JOB) { w.update(); continue; }
-            if (data.version && !coreVersion) {
-                coreVersion = data.version;
-                setDebug("panel v" + PANEL_VERSION + " core v" + coreVersion);
+        watch.statusSeen = true;
+        if (data.version && !watch.coreVersion) {
+            watch.coreVersion = data.version;
+            setDebug("panel v" + PANEL_VERSION + " core v" + watch.coreVersion);
+        }
+
+        var pct = Math.floor(data.percent || 0);
+
+        if (data.state === "starting" || data.state === "downloading") {
+            // STALL BREAKER: no progress for 3 min -> clean error instead of hanging
+            if (pct !== watch.lastPct) {
+                watch.lastPct = pct;
+                watch.lastMove = now;
+            } else if (now - watch.lastMove > 180000) {
+                log("STALL: stuck at " + pct + "% for 180s");
+                return endWatch({ error: "download stalled at " + pct + "% (log saved)" });
             }
-
-            if (data.state === "starting" || data.state === "downloading") {
-                var pct = Math.floor(data.percent || 0);
-                // STALL BREAKER: no progress for 3 min -> clean error instead of infinite hang
-                if (pct !== lastPct) {
-                    lastPct = pct;
-                    lastMove = now;
-                } else if (now - lastMove > 180000) {
-                    log("STALL: stuck at " + pct + "% for 180s");
-                    return finish({ error: "download stalled at " + pct + "% (log saved)" });
-                }
-                note(data.state, pct);
-                bar.text = blocks(pct) + "  " + pct + "%";
-                progressText.text = bar.text;
-                paint(progressText, "accent", "12px Consolas");
-                t.text = "01 FETCH - downloading " + pct + "%";
-                paintStep(s1, "accent");
-            } else if (data.state === "encoding") {
-                note("encoding", Math.floor(data.percent || 0));
-                bar.text = blocks(100) + "  merge";
-                progressText.text = bar.text;
-                paint(progressText, "accent", "12px Consolas");
-                t.text = "02 ENCODE - ffmpeg merging...";
-                paintStep(s1, "ok");
-                paintStep(s2, "accent");
-            } else if (data.state === "updating") {
-                t.text = "updating yt-dlp engine...";
-            } else if (data.state === "done") {
-                log("DONE file=" + (data.file || "none"));
-                bar.text = blocks(100) + "  100%";
-                progressText.text = bar.text;
-                paint(progressText, "ok", "12px Consolas");
-                paintStep(s1, "ok");
-                paintStep(s2, "ok");
-                paintStep(s3, "accent");
-                t.text = "03 TIMELINE - importing...";
-                w.update();
-                if (!data.file) {
-                    log("DONE WITHOUT FILE");
-                    return finish({ error: "the core finished but reported no file" });
-                }
-                return finish({ file: data.file });
-            } else if (data.state === "error") {
-                log("CORE ERROR: " + (data.message || "unknown"));
-                t.text = "ERROR";
-                bar.text = String(data.message || "unknown").slice(0, 60);
-                w.update();
-                $.sleep(3000);
-                var errorMsg = data.message || "unknown";
-                return finish({ error: errorMsg });
+            noteTick(data.state, pct);
+            progressText.text = blocks(pct) + "  " + pct + "%";
+            paint(progressText, "accent", "12px Consolas");
+            setStatus("01 FETCH - downloading " + pct + "%", "text");
+            paintStep(s1, "accent");
+        } else if (data.state === "encoding") {
+            noteTick("encoding", pct);
+            progressText.text = blocks(100) + "  merge";
+            paint(progressText, "accent", "12px Consolas");
+            setStatus("02 ENCODE - ffmpeg merging...", "text");
+            paintStep(s1, "ok");
+            paintStep(s2, "accent");
+        } else if (data.state === "updating") {
+            setStatus("updating yt-dlp engine...", "text");
+        } else if (data.state === "done") {
+            log("DONE file=" + (data.file || "none"));
+            progressText.text = blocks(100) + "  100%";
+            paint(progressText, "ok", "12px Consolas");
+            paintStep(s1, "ok");
+            paintStep(s2, "ok");
+            paintStep(s3, "accent");
+            if (!data.file) {
+                log("DONE WITHOUT FILE");
+                return endWatch({ error: "the core finished but reported no file" });
             }
+            return endWatch({ file: data.file });
+        } else if (data.state === "error") {
+            var msg = data.message || "unknown";
+            log("CORE ERROR: " + msg);
+            progressText.text = String(msg).slice(0, 60);
+            paint(progressText, "err", "12px Consolas");
+            return endWatch({ error: msg });
+        }
 
-            if (now - startTime > 600000) {
-                log("TIMEOUT 10min");
-                return finish({ error: "timeout after 10 min" });
-            }
-            w.update();
+        if (now - watch.startTime > 1800000) {
+            log("TIMEOUT 30min");
+            return endWatch({ error: "timeout after 30 min" });
         }
     }
 
@@ -570,30 +644,34 @@ if (!String.prototype.trim) {
         }
 
         lastCmd = coreCommand();
+        dropCoreLog();
         setDebug("launching core...", "muted");
         log("LAUNCH job=" + JOB + " trim=" + (inPoint && outPoint ? inPoint + "-" + outPoint : "no") +
             " audio=" + (audioCheck.value ? "yes" : "no") + " cmd=" + lastCmd);
 
+        startWatch(function (result) {
+            if (result.error) {
+                setStatus("error: " + result.error, "err");
+                if (result.cmd) setDebug("cmd -> " + result.cmd, "err");
+                resetSteps();
+            } else if (result.file) {
+                autoImport(result.file);
+            } else {
+                setStatus("finished but the core reported no file", "err");
+                resetSteps();
+                log("NO FILE REPORTED");
+            }
+            unlock();
+        });
+        setStatus("starting core...", "text");
+
         // Proves callSystem actually runs things, which is not guaranteed in every AE build
         try { system.callSystem('cmd /c echo ok>"' + CFG.bridgeWin + '\\callproof.txt"'); } catch (e) {}
+        var t0 = new Date().getTime();
         try { system.callSystem(lastCmd); } catch (e) { log("CALLSYSTEM THREW " + e.toString()); }
-        setStatus("working...", "text");
-
-        var result = runModal();
-        log("MODAL RETURNED error=" + (result.error || "none") + " file=" + (result.file || "none"));
-
-        if (result.error) {
-            setStatus("error: " + result.error, "err");
-            if (result.cmd) setDebug("cmd -> " + result.cmd, "err");
-            resetSteps();
-        } else if (result.file) {
-            autoImport(result.file);
-        } else {
-            setStatus("finished but the core reported no file", "err");
-            resetSteps();
-            log("NO FILE REPORTED");
-        }
-        unlock();
+        // If this ever logs minutes again, the pipe redirection has been lost and AE
+        // is about to freeze for the whole download.
+        log("CALLSYSTEM RETURNED in " + (new Date().getTime() - t0) + "ms");
     }
 
     function launchUpdate() {
@@ -604,17 +682,24 @@ if (!String.prototype.trim) {
         dropBtn.enabled = false;
         updateBtn.enabled = false;
         aggressiveCleanup();
-        lastCmd = 'cmd /c start "" /min "' + CFG.exeWin + '" update';
+        dropCoreLog();
+        lastCmd = updateCommand();
         log("LAUNCH UPDATE cmd=" + lastCmd);
+
+        startWatch(function (result) {
+            if (result.error) {
+                setStatus("update error: " + result.error, "err");
+            } else {
+                setStatus("engine updated", "ok");
+            }
+            unlock();
+        });
+        setStatus("updating yt-dlp...", "text");
+
         try { system.callSystem('cmd /c echo ok>"' + CFG.bridgeWin + '\\callproof.txt"'); } catch (e) {}
+        var t0 = new Date().getTime();
         try { system.callSystem(lastCmd); } catch (e) { log("CALLSYSTEM THREW " + e.toString()); }
-        var result = runModal();
-        if (result.error) {
-            setStatus("update error: " + result.error, "err");
-        } else {
-            setStatus("engine updated", "ok");
-        }
-        unlock();
+        log("CALLSYSTEM RETURNED in " + (new Date().getTime() - t0) + "ms");
     }
 
     dropBtn.onClick = function () {

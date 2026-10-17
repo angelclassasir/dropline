@@ -2,6 +2,17 @@
 
 All notable changes to Dropline. Versions match `core/Cargo.toml`; the release ZIP is named from it.
 
+## 1.0.3
+
+### Fixed
+- **After Effects no longer freezes during a download.** `system.callSystem` waits for the process it starts, because the child inherits AE's stdout pipe; the old `cmd /c start` launch therefore blocked the app for the entire download - and forever when the child outlived the session, which is what made AE look like it had crashed. The core is now launched with PowerShell's `Start-Process`, which gives the child fresh handles: `callSystem` returns in ~2.5s and the download continues detached. Measured: 3100ms blocking on a 3s payload before, 28ms-2.5s after, with the payload confirmed to run.
+- **Live progress now actually works.** Polling used to run in a `while (true) { $.sleep(500); w.update(); }` loop, which owns AE's only thread: the app was frozen for the whole download and the "01 FETCH / 02 ENCODE / 03 TIMELINE" steps never updated (the log had zero progress entries in either version). Polling now runs through `app.scheduleTask()`, so AE stays responsive and the panel updates live.
+- The separate "Dropline working" popup window is gone; progress shows in the panel itself, and it keeps working even if the panel is closed while the download finishes.
+- `CALLSYSTEM RETURNED in Nms` and `WATCH STARTED/ENDED` are logged, so a future freeze is obvious in `~/.dropline/dropline.log`.
+
+### Added
+- The core's stdout/stderr are redirected to `DroplineDownloads\core.log` and `core.err.log` for troubleshooting.
+
 ## 1.0.1
 
 ### Fixed
