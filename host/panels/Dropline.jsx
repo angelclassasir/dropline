@@ -1,38 +1,173 @@
-// Dropline v1.5 - flight recorder log + stall breaker + no blind ffmpeg kill
+// Dropline panel v1.0.1 - After Effects ScriptUI panel
+//
+// The URL never touches the command line: it travels inside request.json and the
+// core reads it from there, so there is nothing to escape or inject. Progress
+// comes back through status.json (a file bridge, because callSystem blocks).
+
 if (!String.prototype.trim) {
     String.prototype.trim = function () { return String(this).replace(/^\s+/, "").replace(/\s+$/, ""); };
 }
 
 (function (thisObj) {
-    var HOME = Folder.userData.parent.parent.fsName;
+    var PANEL_VERSION = "1.0.1";
 
-    var CFG = (function () {
-        var exe = "";
-        var bridge = HOME + "/DroplineDownloads";
-        var cfgFile = new File(HOME + "/.dropline/config.json");
-        if (cfgFile.exists) {
-            try {
-                cfgFile.open("r");
-                var data = eval("(" + cfgFile.read() + ")");
-                cfgFile.close();
-                if (data.coreExe) exe = String(data.coreExe).replace(/\\/g, "/");
-                if (data.bridge) bridge = String(data.bridge).replace(/\\/g, "/");
-            } catch (e) {}
-        }
-        return { exe: exe, bridge: bridge, configured: exe !== "" };
+    var HOME = (function () {
+        try { return Folder.userData.parent.parent.fsName; } catch (e) {}
+        try { return Folder("~").fsName; } catch (e2) {}
+        return "";
     })();
 
-    // ===== FLIGHT RECORDER: every phase gets logged =====
+    // ===== minimal JSON reader (never eval file contents) =====
+    function parseJSON(src) {
+        var s = String(src);
+        if (s.charCodeAt(0) === 0xFEFF) s = s.substring(1); // strip BOM
+        var i = 0;
+
+        function skipWS() {
+            while (i < s.length) {
+                var c = s.charAt(i);
+                if (c !== " " && c !== "\t" && c !== "\r" && c !== "\n") return;
+                i++;
+            }
+        }
+        function fail(why) { throw new Error("bad JSON (" + why + ") at " + i); }
+        function readString() {
+            i++; // opening quote
+            var out = "";
+            while (i < s.length) {
+                var c = s.charAt(i++);
+                if (c === '"') return out;
+                if (c !== "\\") { out += c; continue; }
+                var esc = s.charAt(i++);
+                if (esc === "u") { out += String.fromCharCode(parseInt(s.substr(i, 4), 16)); i += 4; }
+                else if (esc === "n") out += "\n";
+                else if (esc === "t") out += "\t";
+                else if (esc === "r") out += "\r";
+                else if (esc === "b") out += "\b";
+                else if (esc === "f") out += "\f";
+                else out += esc; // \"  \\  \/
+            }
+            fail("unterminated string");
+        }
+        function readValue() {
+            skipWS();
+            var c = s.charAt(i);
+            if (c === "{") {
+                i++;
+                var obj = {};
+                skipWS();
+                if (s.charAt(i) === "}") { i++; return obj; }
+                for (;;) {
+                    skipWS();
+                    if (s.charAt(i) !== '"') fail("expected a key");
+                    var key = readString();
+                    skipWS();
+                    if (s.charAt(i) !== ":") fail("expected :");
+                    i++;
+                    obj[key] = readValue();
+                    skipWS();
+                    var delim = s.charAt(i++);
+                    if (delim === "}") return obj;
+                    if (delim !== ",") fail("expected , or }");
+                }
+            }
+            if (c === "[") {
+                i++;
+                var arr = [];
+                skipWS();
+                if (s.charAt(i) === "]") { i++; return arr; }
+                for (;;) {
+                    arr.push(readValue());
+                    skipWS();
+                    var delim2 = s.charAt(i++);
+                    if (delim2 === "]") return arr;
+                    if (delim2 !== ",") fail("expected , or ]");
+                }
+            }
+            if (c === '"') return readString();
+            var rest = s.substr(i);
+            if (rest.indexOf("true") === 0) { i += 4; return true; }
+            if (rest.indexOf("false") === 0) { i += 5; return false; }
+            if (rest.indexOf("null") === 0) { i += 4; return null; }
+            var num = /^-?\d+(\.\d+)?([eE][+-]?\d+)?/.exec(rest);
+            if (!num) fail("unexpected value");
+            i += num[0].length;
+            return parseFloat(num[0]);
+        }
+
+        var result = readValue();
+        skipWS();
+        if (i < s.length) fail("trailing content"); // a half-written file must fail, not half-parse
+        return result;
+    }
+
+    // Writes flat string maps, which is all the core ever needs
+    function jsonString(value) {
+        var text = String(value);
+        var out = '"';
+        for (var i = 0; i < text.length; i++) {
+            var ch = text.charAt(i);
+            var code = text.charCodeAt(i);
+            if (ch === '"' || ch === "\\") out += "\\" + ch;
+            else if (code < 32) out += "\\u" + ("000" + code.toString(16)).slice(-4);
+            else out += ch;
+        }
+        return out + '"';
+    }
+
+    // ===== flight recorder (rotates at 512 KB) =====
     function log(msg) {
         try {
             var dir = new Folder(HOME + "/.dropline");
             if (!dir.exists) dir.create();
-            var f = new File(HOME + "/.dropline/dropline.log");
-            f.open("a");
-            f.writeln(new Date().toString() + " | " + msg);
-            f.close();
+            var file = new File(HOME + "/.dropline/dropline.log");
+            if (file.exists && file.length > 512 * 1024) {
+                var old = new File(HOME + "/.dropline/dropline.log.1");
+                if (old.exists) { try { old.remove(); } catch (e0) {} }
+                try { file.rename("dropline.log.1"); } catch (e1) {}
+                file = new File(HOME + "/.dropline/dropline.log");
+            }
+            file.encoding = "UTF-8";
+            file.open("a");
+            file.writeln(new Date().toString() + " | " + msg);
+            file.close();
         } catch (e) {}
     }
+
+    var CFG = (function () {
+        var cfg = {
+            exe: "", exeWin: "",
+            bridge: HOME.replace(/\\/g, "/") + "/DroplineDownloads",
+            bridgeWin: HOME.replace(/\//g, "\\") + "\\DroplineDownloads",
+            configured: false
+        };
+        var cfgFile = new File(HOME + "/.dropline/config.json");
+        if (cfgFile.exists) {
+            try {
+                cfgFile.encoding = "UTF-8";
+                cfgFile.open("r");
+                var raw = cfgFile.read();
+                cfgFile.close();
+                var data = parseJSON(raw);
+                if (data) {
+                    if (data.coreExe) {
+                        cfg.exe = String(data.coreExe).replace(/\\/g, "/");
+                        cfg.exeWin = String(data.coreExe);
+                    }
+                    if (data.bridge) {
+                        cfg.bridge = String(data.bridge).replace(/\\/g, "/");
+                        cfg.bridgeWin = String(data.bridge);
+                    }
+                }
+            } catch (e) {
+                log("CONFIG PARSE FAILED " + e.toString());
+            }
+        }
+        cfg.configured = cfg.exe !== "";
+        cfg.request = cfg.bridge + "/request.json";
+        cfg.requestWin = cfg.bridgeWin + "\\request.json";
+        return cfg;
+    })();
 
     var C = {
         bg:      [0.08, 0.08, 0.10, 1],
@@ -146,7 +281,7 @@ if (!String.prototype.trim) {
         paint(statusText, color || "text", "10px Segoe UI");
     }
 
-    var dbg = pal.add("statictext", undefined, "dropline v1.0");
+    var dbg = pal.add("statictext", undefined, "dropline v" + PANEL_VERSION);
     paint(dbg, "muted", "8px Consolas");
     function setDebug(msg, color) {
         dbg.text = msg;
@@ -159,7 +294,7 @@ if (!String.prototype.trim) {
     updateBtn.preferredSize.height = 22;
 
     var busy = false;
-    var updating = false;
+    var JOB = "";
     var lastCmd = "";
 
     function blocks(pct) {
@@ -177,36 +312,62 @@ if (!String.prototype.trim) {
         } catch (e) {}
         $.sleep(400);
         try {
-            var statusFile = new File(CFG.bridge + "/status.json");
-            if (statusFile.exists) statusFile.remove();
-            var proofFile = new File(CFG.bridge + "/callproof.txt");
-            if (proofFile.exists) proofFile.remove();
-            // Clean up old .part files to avoid confusion
+            var junk = ["/status.json", "/callproof.txt", "/request.json"];
+            for (var i = 0; i < junk.length; i++) {
+                var f = new File(CFG.bridge + junk[i]);
+                if (f.exists) f.remove();
+            }
             var bridgeFolder = new Folder(CFG.bridge);
             if (bridgeFolder.exists) {
                 var partFiles = bridgeFolder.getFiles("*.part");
-                for (var i = 0; i < partFiles.length; i++) {
-                    try { partFiles[i].remove(); } catch (e) {}
+                for (var j = 0; j < partFiles.length; j++) {
+                    try { partFiles[j].remove(); } catch (e2) {}
                 }
             }
         } catch (e) {}
     }
 
-
-    function cmdSafe(s) { return String(s).replace(/([&|<>^])/g, "^$1"); }
-
-    function buildCmd(argArray) {
-        // start is a cmd builtin: the cmd /c wrapper is mandatory
-        var line = 'cmd /c start /min ' + CFG.exe;
-        for (var i = 0; i < argArray.length; i++) {
-            line += ' ' + cmdSafe(argArray[i]);
+    function writeRequest(fields) {
+        var parts = [];
+        for (var key in fields) {
+            if (fields.hasOwnProperty(key)) parts.push(jsonString(key) + ":" + jsonString(fields[key]));
         }
-        return line;
+        var file = new File(CFG.request);
+        file.encoding = "UTF-8";
+        file.open("w");
+        file.write("{" + parts.join(",") + "}");
+        file.close();
+    }
+
+    // Only sandboxed filesystem paths go on the shell line; the URL travels in request.json
+    function coreCommand() {
+        return 'cmd /c start "" /min "' + CFG.exeWin + '" cli --request "' + CFG.requestWin + '"';
+    }
+
+    function readStatus() {
+        var file = new File(CFG.bridge + "/status.json");
+        if (!file.exists) return null;
+        var data = null;
+        var retries = 0;
+        while (retries < 3) {
+            try {
+                file.encoding = "UTF-8";
+                file.open("r");
+                var text = file.read();
+                file.close();
+                data = parseJSON(text);
+                if (data && data.state) break; // success
+            } catch (e) {
+                try { file.close(); } catch (e2) {}
+                retries++;
+                if (retries < 3) $.sleep(300); // wait before retry
+            }
+        }
+        return (data && data.state) ? data : null;
     }
 
     function unlock() {
         busy = false;
-        updating = false;
         dropBtn.enabled = true;
         updateBtn.enabled = true;
     }
@@ -228,52 +389,56 @@ if (!String.prototype.trim) {
         var proofChecked = false;
         var lastPct = -1;
         var lastMove = startTime;
+        var lastLogPct = -1;
+        var lastLogState = "";
+        var coreVersion = "";
+
+        function note(state, pct) {
+            if (state !== lastLogState || pct >= lastLogPct + 5) {
+                lastLogState = state;
+                lastLogPct = pct;
+                log("tick " + state + " " + pct + "%");
+            }
+        }
+        function finish(result) {
+            w.close();
+            $.sleep(300);
+            aggressiveCleanup();
+            return result;
+        }
+
         while (true) {
             $.sleep(500);
             var now = new Date().getTime();
-            var f = new File(CFG.bridge + "/status.json");
+            var statusFile = new File(CFG.bridge + "/status.json");
 
-            if (!f.exists) {
+            if (!statusFile.exists) {
                 if (now - startTime > 6000 && !proofChecked) {
                     proofChecked = true;
                     var proof = new File(CFG.bridge + "/callproof.txt");
                     if (!proof.exists) {
-                        w.close();
-                        $.sleep(300);
                         log("FAIL: callSystem dead (no proof file)");
-                        aggressiveCleanup();
-                        return { error: "callSystem executes nothing here" };
+                        return finish({ error: "callSystem executes nothing here" });
                     }
                 }
                 if (now - startTime > 15000) {
-                    w.close();
-                    $.sleep(300);
                     log("FAIL: core did not start within 15s");
-                    aggressiveCleanup();
-                    return { error: "core did not start - see footer", cmd: lastCmd };
+                    return finish({ error: "core did not start - see footer", cmd: lastCmd });
                 }
                 t.text = "starting core...";
                 w.update();
                 continue;
             }
 
-            var txt = "";
-            var data = null;
-            var retries = 0;
-            while (retries < 3) {
-                try {
-                    f.open("r");
-                    txt = f.read();
-                    f.close();
-                    data = eval("(" + txt + ")");
-                    if (data && data.state) break;  // Success
-                } catch (e) {
-                    try { f.close(); } catch (e2) {}
-                    retries++;
-                    if (retries < 3) $.sleep(300);  // Wait before retry
-                }
+            var data = readStatus();
+            if (!data) { w.update(); continue; }
+
+            // A leftover status file from another job must never drive this run
+            if (data.job && JOB && data.job !== JOB) { w.update(); continue; }
+            if (data.version && !coreVersion) {
+                coreVersion = data.version;
+                setDebug("panel v" + PANEL_VERSION + " core v" + coreVersion);
             }
-            if (!data || !data.state) { w.update(); continue; }
 
             if (data.state === "starting" || data.state === "downloading") {
                 var pct = Math.floor(data.percent || 0);
@@ -282,20 +447,17 @@ if (!String.prototype.trim) {
                     lastPct = pct;
                     lastMove = now;
                 } else if (now - lastMove > 180000) {
-                    w.close();
-                    $.sleep(300);
                     log("STALL: stuck at " + pct + "% for 180s");
-                    aggressiveCleanup();
-                    return { error: "download stalled at " + pct + "% (log saved)" };
+                    return finish({ error: "download stalled at " + pct + "% (log saved)" });
                 }
-                log("tick " + data.state + " " + pct + "%");
+                note(data.state, pct);
                 bar.text = blocks(pct) + "  " + pct + "%";
                 progressText.text = bar.text;
                 paint(progressText, "accent", "12px Consolas");
                 t.text = "01 FETCH - downloading " + pct + "%";
                 paintStep(s1, "accent");
             } else if (data.state === "encoding") {
-                log("tick encoding");
+                note("encoding", Math.floor(data.percent || 0));
                 bar.text = blocks(100) + "  merge";
                 progressText.text = bar.text;
                 paint(progressText, "accent", "12px Consolas");
@@ -314,12 +476,11 @@ if (!String.prototype.trim) {
                 paintStep(s3, "accent");
                 t.text = "03 TIMELINE - importing...";
                 w.update();
-                var result = { file: data.file || null };
-                try { f.remove(); } catch (e) {}
-                w.close();
-                $.sleep(400);
-                aggressiveCleanup();
-                return result;
+                if (!data.file) {
+                    log("DONE WITHOUT FILE");
+                    return finish({ error: "the core finished but reported no file" });
+                }
+                return finish({ file: data.file });
             } else if (data.state === "error") {
                 log("CORE ERROR: " + (data.message || "unknown"));
                 t.text = "ERROR";
@@ -327,19 +488,12 @@ if (!String.prototype.trim) {
                 w.update();
                 $.sleep(3000);
                 var errorMsg = data.message || "unknown";
-                try { f.remove(); } catch (e) {}
-                w.close();
-                $.sleep(400);
-                aggressiveCleanup();
-                return { error: errorMsg };
+                return finish({ error: errorMsg });
             }
 
             if (now - startTime > 600000) {
-                w.close();
-                $.sleep(400);
                 log("TIMEOUT 10min");
-                aggressiveCleanup();
-                return { error: "timeout after 10 min" };
+                return finish({ error: "timeout after 10 min" });
             }
             w.update();
         }
@@ -382,10 +536,14 @@ if (!String.prototype.trim) {
 
     function launch() {
         if (busy) return;
-        var url = urlInput.text.trim();
-        url = url.replace(/"/g, "");
+        var url = urlInput.text.replace(/^\s+|\s+$/g, "");
         if (!url) { setStatus("paste a URL first", "err"); return; }
-        if (!CFG.configured || !(new File(CFG.exe)).exists) { setStatus("run scripts/install.ps1 first", "err"); setDebug("config missing: ~/.dropline/config.json", "err"); return; }
+        if (!CFG.configured || !(new File(CFG.exe)).exists) {
+            setStatus("run scripts/install.ps1 first", "err");
+            setDebug("config missing: ~/.dropline/config.json", "err");
+            return;
+        }
+        if (!system || !system.callSystem) { setStatus("system.callSystem is not available here", "err"); return; }
 
         busy = true;
         dropBtn.enabled = false;
@@ -396,19 +554,29 @@ if (!String.prototype.trim) {
         paint(progressText, "accent", "12px Consolas");
         aggressiveCleanup();
 
-        var argArray = ["cli", "--url", url];
-        var a = inInput.text.trim();
-        var b = outInput.text.trim();
-        if (a && b) { argArray.push("--start"); argArray.push(a); argArray.push("--end"); argArray.push(b); }
-        if (audioCheck.value) { argArray.push("--audio-only"); }
-        lastCmd = buildCmd(argArray);
-        setDebug("launching core...", "muted");
-        log("LAUNCH trim=" + (a && b ? a + "-" + b : "no") + " cmd=" + lastCmd);
+        JOB = "j" + (new Date().getTime()) + Math.floor(Math.random() * 1000);
+        var inPoint = inInput.text.replace(/^\s+|\s+$/g, "");
+        var outPoint = outInput.text.replace(/^\s+|\s+$/g, "");
+        var request = { url: url, job: JOB, audioOnly: audioCheck.value ? "1" : "0" };
+        if (inPoint && outPoint) { request.start = inPoint; request.end = outPoint; }
 
         try {
-            system.callSystem('cmd /c echo ok> ' + CFG.bridge.replace(/\//g, "\\") + '\\callproof.txt');
-        } catch (e) {}
-        system.callSystem(lastCmd);
+            writeRequest(request);
+        } catch (e) {
+            setStatus("cannot write request file: " + e.toString(), "err");
+            log("REQUEST WRITE FAILED " + e.toString());
+            unlock();
+            return;
+        }
+
+        lastCmd = coreCommand();
+        setDebug("launching core...", "muted");
+        log("LAUNCH job=" + JOB + " trim=" + (inPoint && outPoint ? inPoint + "-" + outPoint : "no") +
+            " audio=" + (audioCheck.value ? "yes" : "no") + " cmd=" + lastCmd);
+
+        // Proves callSystem actually runs things, which is not guaranteed in every AE build
+        try { system.callSystem('cmd /c echo ok>"' + CFG.bridgeWin + '\\callproof.txt"'); } catch (e) {}
+        try { system.callSystem(lastCmd); } catch (e) { log("CALLSYSTEM THREW " + e.toString()); }
         setStatus("working...", "text");
 
         var result = runModal();
@@ -419,11 +587,11 @@ if (!String.prototype.trim) {
             if (result.cmd) setDebug("cmd -> " + result.cmd, "err");
             resetSteps();
         } else if (result.file) {
-            if (updating) {
-                setStatus("engine updated", "ok");
-            } else {
-                autoImport(result.file);
-            }
+            autoImport(result.file);
+        } else {
+            setStatus("finished but the core reported no file", "err");
+            resetSteps();
+            log("NO FILE REPORTED");
         }
         unlock();
     }
@@ -432,13 +600,14 @@ if (!String.prototype.trim) {
         if (busy) return;
         if (!CFG.configured || !(new File(CFG.exe)).exists) { setStatus("run scripts/install.ps1 first", "err"); return; }
         busy = true;
-        updating = true;
+        JOB = "u" + new Date().getTime();
         dropBtn.enabled = false;
         updateBtn.enabled = false;
         aggressiveCleanup();
-        lastCmd = buildCmd(["update"]);
-        log("LAUNCH UPDATE");
-        system.callSystem(lastCmd);
+        lastCmd = 'cmd /c start "" /min "' + CFG.exeWin + '" update';
+        log("LAUNCH UPDATE cmd=" + lastCmd);
+        try { system.callSystem('cmd /c echo ok>"' + CFG.bridgeWin + '\\callproof.txt"'); } catch (e) {}
+        try { system.callSystem(lastCmd); } catch (e) { log("CALLSYSTEM THREW " + e.toString()); }
         var result = runModal();
         if (result.error) {
             setStatus("update error: " + result.error, "err");
@@ -467,8 +636,8 @@ if (!String.prototype.trim) {
         }
     };
 
-    setDebug((CFG.configured ? "core OK" : "run install.ps1") + " · dropline v1.0", "muted");
-    log("PANEL LOADED v1.5");
+    setDebug((CFG.configured ? "core OK" : "run install.ps1") + " · v" + PANEL_VERSION, "muted");
+    log("PANEL LOADED v" + PANEL_VERSION);
 
     if (pal instanceof Window) {
         pal.center();

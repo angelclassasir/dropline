@@ -1,9 +1,17 @@
 [package]
 name = "dropline"
-version = "1.0.0"
-description = "Dropline core: headless video fetcher bridge for After Effects"
-authors = ["ZapNap"]
+version = "1.0.1"
 edition = "2021"
+rust-version = "1.75"
+description = "Dropline core: headless video fetcher bridge for After Effects"
+license = "MIT"
+repository = "https://github.com/angelclassasir/dropline"
+authors = ["ZapNap"]
+
+# The artifact is called dropline-core.exe so it can be copied into bin/ as-is
+[[bin]]
+name = "dropline-core"
+path = "src/main.rs"
 
 [dependencies]
 serde_json = "1"
