@@ -1,16 +1,15 @@
-// Dropline panel v1.0.2 - After Effects ScriptUI panel
+// Dropline panel v1.0.4 - After Effects ScriptUI panel
 //
 // The URL never touches the command line: it travels inside request.json and the
 // core reads it from there, so there is nothing to escape or inject. Progress
 // comes back through status.json.
 //
 // Two hard-won rules in here, both learned the hard way:
-//   1. system.callSystem blocks until the process it started finishes, because the
-//      child inherits AE's stdout pipe - `cmd /c start` therefore froze After
-//      Effects for the entire download (and forever when the child outlived the
-//      session). The core is launched with PowerShell's Start-Process instead,
-//      which gives the child fresh handles: callSystem returns in ~2.5s and the
-//      download continues detached, logging to core.log.
+//   1. system.callSystem blocks until every process holding AE's stdout pipe is gone,
+//      so `cmd /c start` froze After Effects for the entire download (and forever when
+//      the child outlived the session). The core is started through a generated .vbs
+//      run by wscript.exe: WScript.Shell.Run gives it a private hidden console, so
+//      callSystem returns in ~300ms while the download continues detached.
 //   2. Polling must never run in a while + $.sleep loop: that owns the app's
 //      thread and freezes the UI. app.scheduleTask() gives the polling back to
 //      After Effects' own event loop, so the app stays responsive.
@@ -20,7 +19,7 @@ if (!String.prototype.trim) {
 }
 
 (function (thisObj) {
-    var PANEL_VERSION = "1.0.3";
+    var PANEL_VERSION = "1.0.4";
 
     var HOME = (function () {
         try { return Folder.userData.parent.parent.fsName; } catch (e) {}
@@ -180,6 +179,8 @@ if (!String.prototype.trim) {
         cfg.coreLog = cfg.bridge + "/core.log";
         cfg.coreLogWin = cfg.bridgeWin + "\\core.log";
         cfg.errLogWin = cfg.bridgeWin + "\\core.err.log";
+        cfg.launcher = HOME.replace(/\\/g, "/") + "/.dropline/dropline-launch.vbs";
+        cfg.launcherWin = HOME.replace(/\//g, "\\") + "\\.dropline\\dropline-launch.vbs";
         return cfg;
     })();
 
@@ -355,31 +356,32 @@ if (!String.prototype.trim) {
 
     // Only sandboxed filesystem paths go on the shell line; the URL travels in request.json.
     //
-    // Launching the core is the delicate part. ANY command that lets the child inherit
-    // AE's stdout pipe makes system.callSystem wait for that child, which froze After
-    // Effects for the whole download - and forever if the child outlived the session.
-    // `cmd /c start` always inherits (measured: it blocks). PowerShell's Start-Process
-    // gives the child brand new handles, so callSystem returns in ~2.5s (PowerShell's
-    // own startup) while the core downloads detached; its output lands in core.log.
-    function psQuote(s) {
-        return "'" + String(s).replace(/'/g, "''") + "'";
-    }
-
-    function psLaunch(argumentList) {
-        return 'powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "Start-Process -FilePath ' +
-               psQuote(CFG.exeWin) +
-               ' -ArgumentList ' + argumentList +
-               ' -RedirectStandardOutput ' + psQuote(CFG.coreLogWin) +
-               ' -RedirectStandardError ' + psQuote(CFG.errLogWin) +
-               ' -WindowStyle Hidden"';
+    // Launching the core is the delicate part, and every "clever" way of doing it has
+    // cost a frozen After Effects at some point:
+    //   - `cmd /c start ...` leaves the child holding AE's stdout pipe, so callSystem
+    //     waits for the whole download (and forever if that child outlives the session).
+    //   - PowerShell's Start-Process looked right from Node but under AE either returned
+    //     before starting anything or blocked for the download, depending on quoting.
+    //   - the redirection has to live in a file, never in the string AE may re-parse.
+    // What works: a two-line .vbs written here and run by wscript.exe. WScript.Shell.Run
+    // with (window 0, wait False) gives the core its own hidden console, so no handle of
+    // AE's pipe survives, and wscript exits at once. Measured inside AE: 278 ms to EOF
+    // while the core downloaded the clip to completion.
+    function writeLauncher(arguments) {
+        var text = 'CreateObject("WScript.Shell").Run """' + CFG.exeWin + '"" ' + arguments + '", 0, False\r\n';
+        var file = new File(CFG.launcher);
+        if (!file.open("w")) throw new Error("cannot write " + CFG.launcher);
+        file.write(text);
+        file.close();
+        return 'wscript.exe //nologo //B "' + CFG.launcherWin + '"';
     }
 
     function coreCommand() {
-        return psLaunch("'cli','--request'," + psQuote(CFG.requestWin));
+        return writeLauncher('cli --request ""' + CFG.requestWin + '""');
     }
 
     function updateCommand() {
-        return psLaunch("'update'");
+        return writeLauncher('update');
     }
 
     function dropCoreLog() {
@@ -427,9 +429,10 @@ if (!String.prototype.trim) {
     // progress actually reaches the UI - which is what the README always promised.
     var watch = null;
 
-    function startWatch(onDone) {
+    function startWatch(onDone, mode) {
         watch = {
             job: JOB,
+            mode: mode || "job",
             onDone: onDone,
             startTime: new Date().getTime(),
             lastMove: new Date().getTime(),
@@ -443,7 +446,9 @@ if (!String.prototype.trim) {
         };
         $.global.__droplinePoll = watchTick;
         try {
-            watch.taskId = app.scheduleTask("(typeof __droplinePoll === 'function') && __droplinePoll();", 500, true);
+            // $.global is explicit on purpose: scheduleTask evaluates the string in the
+            // app-wide scope, and the panel's locals live in its closure.
+            watch.taskId = app.scheduleTask("$.global.__droplinePoll && $.global.__droplinePoll();", 500, true);
             log("WATCH STARTED job=" + watch.job + " task=" + watch.taskId);
         } catch (e) {
             log("SCHEDULETASK FAILED " + e.toString());
@@ -548,6 +553,13 @@ if (!String.prototype.trim) {
         } else if (data.state === "updating") {
             setStatus("updating yt-dlp engine...", "text");
         } else if (data.state === "done") {
+            // The engine update reports done with no file; only a download owes us one.
+            if (watch.mode === "update") {
+                log("UPDATE DONE " + (data.message || ""));
+                progressText.text = blocks(100) + "  100%";
+                paint(progressText, "ok", "12px Consolas");
+                return endWatch({ ok: true, message: data.message || "updated" });
+            }
             log("DONE file=" + (data.file || "none"));
             progressText.text = blocks(100) + "  100%";
             paint(progressText, "ok", "12px Consolas");
@@ -693,7 +705,7 @@ if (!String.prototype.trim) {
                 setStatus("engine updated", "ok");
             }
             unlock();
-        });
+        }, "update");
         setStatus("updating yt-dlp...", "text");
 
         try { system.callSystem('cmd /c echo ok>"' + CFG.bridgeWin + '\\callproof.txt"'); } catch (e) {}
@@ -718,6 +730,61 @@ if (!String.prototype.trim) {
             log("UPDATE HANDLER EXCEPTION " + e.toString());
             aggressiveCleanup();
             unlock();
+        }
+    };
+
+    // Every ExtendScript entry point in After Effects shares one global namespace, so
+    // this hook lets an automated check (or the MCP bridge) drive the very same
+    // pipeline the button drives - it is the only way to test the click path without
+    // a human, and the button still goes through launch() itself.
+    function fillFields(url, inPoint, outPoint, audioOnly) {
+        urlInput.text = url || "";
+        inInput.text = inPoint || "";
+        outInput.text = outPoint || "";
+        audioCheck.value = audioOnly ? true : false;
+    }
+
+    $.global.__dropline = {
+        version: PANEL_VERSION,
+        drop: function (url, inPoint, outPoint, audioOnly) {
+            try {
+                fillFields(url, inPoint, outPoint, audioOnly);
+                launch();
+                return { started: true, busy: busy, job: JOB };
+            } catch (e) {
+                log("HOOK EXCEPTION line " + e.line + " " + e.toString());
+                unlock();
+                return { started: false, error: e.toString() };
+            }
+        },
+        // Same thing, but through the button's own event handler.
+        click: function (url, inPoint, outPoint, audioOnly) {
+            fillFields(url, inPoint, outPoint, audioOnly);
+            var how = "notify";
+            try {
+                if (dropBtn.notify) dropBtn.notify("onClick");
+                else { how = "handler"; dropBtn.onClick(); }
+            } catch (e) {
+                log("CLICK EXCEPTION line " + e.line + " " + e.toString());
+                unlock();
+                return { clicked: false, error: e.toString() };
+            }
+            return { clicked: true, how: how, busy: busy, job: JOB };
+        },
+        state: function () {
+            return {
+                version: PANEL_VERSION,
+                busy: busy,
+                job: JOB,
+                status: statusText.text,
+                progress: progressText.text,
+                debug: dbg.text
+            };
+        },
+        // Same path the "update engine" button takes.
+        update: function () {
+            try { launchUpdate(); return { started: true, busy: busy, job: JOB }; }
+            catch (e) { log("UPDATE HOOK EXCEPTION " + e.toString()); unlock(); return { started: false, error: e.toString() }; }
         }
     };
 

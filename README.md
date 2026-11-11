@@ -29,10 +29,12 @@ Dropline ships as an After Effects ScriptUI panel plus a tiny Rust core:
 
 The URL never sits on the command line: it travels inside `request.json`, so there is nothing to escape or inject. The panel never blocks on the network either - the core publishes progress to the bridge file and the panel imports the result when the download finishes.
 
+The core itself is started through a two-line `.vbs` in `~/.dropline` run by `wscript.exe`. `WScript.Shell.Run(..., 0, False)` gives it a private hidden console, so no process inherits After Effects' stdout pipe: `system.callSystem` returns in about 250 ms instead of waiting for the whole download, and polling runs on `app.scheduleTask` instead of a blocking loop.
+
 ## Install (easy way, recommended)
-1. Download the latest `Dropline-v1.0.3.zip` from the Releases page
+1. Download the latest `Dropline-v1.0.4.zip` from the Releases page
 2. Unzip it anywhere
-3. Double-click `install.bat`
+3. Double-click `install.bat` (no administrator rights needed)
 4. Restart After Effects → Window → Dropline
 
 ## Install (from source)
@@ -46,8 +48,8 @@ The URL never sits on the command line: it travels inside `request.json`, so the
 - **"core did not start"** - the panel could not spawn the core. Check `~/.dropline/config.json` exists and that `coreExe` points at a real `bin\dropline-core.exe`.
 - **"yt-dlp not found"** - run `scripts\fetch-deps.ps1`, or set `"ytdlp"` in `~/.dropline/config.json` to an existing path.
 - **"download stalled"** - the platform stopped sending data for 3 minutes. Click "update engine" and retry.
-- **After Effects feels frozen right after clicking DROP IT** - that was a real bug up to 1.0.2 (the launch held AE's stdout pipe, so `callSystem` waited for the whole download). It is fixed in 1.0.3: the log now shows `CALLSYSTEM RETURNED in Nms` with a small N. If you ever see a large N there, something has reintroduced it.
-- **The engine or yt-dlp fails** - `DroplineDownloads\core.log` and `core.err.log` hold the core's own output.
+- **After Effects feels frozen right after clicking DROP IT** - that was a real bug up to 1.0.3: the launch left a process holding AE's stdout pipe, so `callSystem` waited for the whole download (and forever if that process outlived the session). 1.0.4 starts the core through `wscript.exe`, which gives it a private console. The log now shows `CALLSYSTEM RETURNED in Nms` with a small N (~250 ms); a large N means something reintroduced the bug.
+- **The engine or yt-dlp fails** - the core writes the reason into `DroplineDownloads\status.json` (the panel shows the same text) and in `~/.dropline/dropline.log`.
 - **Anything else** - open `~/.dropline/dropline.log`. Every phase is logged there, including the exact command the panel ran.
 
 ## Requirements
@@ -59,10 +61,9 @@ The URL never sits on the command line: it travels inside `request.json`, so the
 - **Trim accuracy**: segment trim cuts at the nearest keyframe (±1-2 seconds), not frame-exact. This is a trade-off for speed and AE compatibility.
 - **Trim re-encodes**: cutting a segment cannot be a pure stream copy if you want clean edges, so trimmed clips are re-encoded (H.264 / AAC). Untrimmed downloads are copied as-is.
 - **yt-dlp updates**: platforms change their defenses frequently. Use the "update engine" button in the panel to keep yt-dlp fresh.
-- **Windows only**: the panel drives `cmd`/`taskkill`, so macOS and Linux are not supported.
+- **Windows only**: the panel drives `wscript`/`taskkill`, so macOS and Linux are not supported.
 
 ## Roadmap
-- Non-blocking progress (BridgeTalk async)
 - Format/quality picker and thumbnail preview
 - Download history and cache cleanup
 - Single-exe installer (Inno Setup)

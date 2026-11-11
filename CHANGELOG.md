@@ -2,6 +2,20 @@
 
 All notable changes to Dropline. Versions match `core/Cargo.toml`; the release ZIP is named from it.
 
+## 1.0.4
+
+### Fixed
+- **The panel now really starts the core from inside After Effects.** 1.0.3 replaced `cmd /c start` with a PowerShell `Start-Process` one-liner, which was measured from Node and looked right - but under AE's `system.callSystem` it returned in 208 ms having started nothing, because the nested quotes do not survive the trip. The launch now writes a two-line `.vbs` and runs it with `wscript.exe`; `WScript.Shell.Run(..., 0, False)` gives the core its own hidden console, so no process holds AE's stdout pipe and there is nothing left to quote. Measured inside AE: `CALLSYSTEM RETURNED in 252-298 ms` while the download continued detached.
+- **"update engine" no longer reports a false error.** The updater finishes with `done` and no file, which the download watcher read as "finished but reported no file". The watcher now knows when it is watching an update.
+- The launcher lives in `~/.dropline` instead of the downloads folder, so Dropline no longer leaves a `.vbs` among the videos.
+
+### Verified
+- End to end, inside After Effects, with the installed panel: plain YouTube download; trimmed segment (00:02:34-00:02:40 lands as a 6 s layer); audio-only (`.m4a`, audio and no video); engine update; and a second run while the first download was in flight. Live progress ticks every second throughout, and AE stays responsive - `DROP IT` was fired through the button's own `onClick` handler for the last check.
+
+### Changed
+- The panel installs into `%APPDATA%\Adobe\After Effects\<version>\Scripts\ScriptUI Panels`, which needs no administrator rights. `install.ps1` removes a legacy copy from `Program Files` when it can, and warns if it cannot (two copies would list Dropline twice in the Window menu).
+- The panel exposes `$.global.__dropline` (`drop`, `click`, `update`, `state`) so the whole pipeline can be driven from a script; `click()` fires the button's real event handler.
+
 ## 1.0.3
 
 ### Fixed

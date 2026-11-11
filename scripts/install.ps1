@@ -1,44 +1,43 @@
 ﻿#Requires -Version 5.1
-# Install Dropline: write the user config and copy the panel into every After Effects found.
+# Install Dropline: write the user config and copy the panel into the After Effects
+# user ScriptUI Panels folder (no administrator rights needed).
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+$panelSource = Join-Path $root 'host\panels\Dropline.jsx'
 
-function Find-AfterEffectsPanelsFolders {
+function Find-AfterEffectsUserPanelFolders {
+    # After Effects scans %APPDATA%\Adobe\After Effects\<version>\Scripts\ScriptUI Panels
+    # for every version it has run, and this location is always writable by the user.
     $found = New-Object System.Collections.ArrayList
-
-    # 1) Registry: Adobe records the install path per version
-    $regRoots = @(
-        'HKLM:\SOFTWARE\Adobe\After Effects',
-        'HKLM:\SOFTWARE\WOW6432Node\Adobe\After Effects'
-    )
-    foreach ($regRoot in $regRoots) {
-        if (-not (Test-Path $regRoot)) { continue }
-        foreach ($key in (Get-ChildItem $regRoot -ErrorAction SilentlyContinue)) {
-            $props = Get-ItemProperty -Path $key.PSPath -ErrorAction SilentlyContinue
-            if (-not $props) { continue }
-            foreach ($candidate in @($props.InstallPath, $props.SupportFilesPath)) {
-                if (-not $candidate) { continue }
-                $base = $candidate
-                if (-not (Test-Path (Join-Path $base 'Scripts\ScriptUI Panels'))) {
-                    $base = Join-Path $base 'Support Files'
-                }
-                $panels = Join-Path $base 'Scripts\ScriptUI Panels'
-                if (Test-Path $panels) { [void]$found.Add($panels) }
+    $prefsRoot = Join-Path $env:APPDATA 'Adobe\After Effects'
+    if (Test-Path $prefsRoot) {
+        foreach ($ver in (Get-ChildItem $prefsRoot -Directory -ErrorAction SilentlyContinue)) {
+            if ($ver.Name -notmatch '^\d+(\.\d+)?$') { continue }
+            $panels = Join-Path $ver.FullName 'Scripts\ScriptUI Panels'
+            if (-not (Test-Path $panels)) {
+                New-Item -ItemType Directory -Force -Path $panels | Out-Null
             }
+            [void]$found.Add($panels)
         }
     }
+    return ($found | Select-Object -Unique)
+}
 
-    # 2) Filesystem fallback, for custom install locations
+function Find-LegacyProgramFilesPanels {
+    # Older releases installed into Program Files (admin required). A copy left there
+    # would make Window > Dropline appear twice, so it is removed when possible.
+    $found = New-Object System.Collections.ArrayList
     $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
     foreach ($rootDir in $roots) {
         $adobe = Join-Path $rootDir 'Adobe'
         if (-not (Test-Path $adobe)) { continue }
         foreach ($ae in (Get-ChildItem $adobe -Directory -Filter 'Adobe After Effects *' -ErrorAction SilentlyContinue)) {
             $panels = Join-Path $ae.FullName 'Support Files\Scripts\ScriptUI Panels'
-            if (Test-Path $panels) { [void]$found.Add($panels) }
+            if ((Test-Path $panels) -and (Test-Path (Join-Path $panels 'Dropline.jsx'))) {
+                [void]$found.Add($panels)
+            }
         }
     }
-
     return ($found | Select-Object -Unique)
 }
 
@@ -56,27 +55,31 @@ $cfg = [ordered]@{
 [System.IO.File]::WriteAllText($cfgPath, $cfg, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "Config written: $cfgPath" -ForegroundColor Green
 
-# 2) Copy the panel into every After Effects install found
-$targets = @(Find-AfterEffectsPanelsFolders)
-$copied = 0
-if ($targets.Count -gt 0) {
-    foreach ($target in $targets) {
-        try {
-            Copy-Item (Join-Path $root 'host\panels\Dropline.jsx') $target -Force -ErrorAction Stop
-            Write-Host "Panel installed into: $target" -ForegroundColor Green
-            $copied++
-        } catch {
-            Write-Host "Could not write to $target" -ForegroundColor Yellow
-            Write-Host "  $($_.Exception.Message)" -ForegroundColor DarkYellow
-            Write-Host "  Right-click install.bat > Run as administrator, or copy host\panels\Dropline.jsx there by hand." -ForegroundColor Yellow
-        }
-    }
+# 2) Copy the panel into the user-level ScriptUI Panels folder of every AE version
+$targets = @(Find-AfterEffectsUserPanelFolders)
+if ($targets.Count -eq 0) {
+    Write-Host "No After Effects preferences folder found." -ForegroundColor Yellow
+    Write-Host "Run After Effects once, then run this installer again." -ForegroundColor Yellow
 } else {
-    Write-Host "After Effects was not found automatically." -ForegroundColor Yellow
-    Write-Host "Copy host\panels\Dropline.jsx into '...\Support Files\Scripts\ScriptUI Panels' by hand." -ForegroundColor Yellow
+    foreach ($target in $targets) {
+        Copy-Item $panelSource $target -Force
+        Write-Host "Panel installed into: $target" -ForegroundColor Green
+    }
 }
 
-# 3) Reminder about binaries
+# 3) Remove legacy Program Files copies (avoids two Dropline entries in the Window menu)
+foreach ($legacy in @(Find-LegacyProgramFilesPanels)) {
+    try {
+        Remove-Item (Join-Path $legacy 'Dropline.jsx') -Force -ErrorAction Stop
+        Write-Host "Removed legacy copy from: $legacy" -ForegroundColor Green
+    } catch {
+        Write-Host "An older copy is still in Program Files and cannot be removed without admin rights:" -ForegroundColor Yellow
+        Write-Host "  $(Join-Path $legacy 'Dropline.jsx')" -ForegroundColor Yellow
+        Write-Host "  Delete it once (right-click install.bat > Run as administrator) or After Effects will list Dropline twice." -ForegroundColor Yellow
+    }
+}
+
+# 4) Reminder about binaries
 $missing = @()
 foreach ($bin in @('dropline-core.exe', 'yt-dlp.exe', 'ffmpeg.exe')) {
     if (-not (Test-Path (Join-Path $root "bin\$bin"))) { $missing += $bin }
