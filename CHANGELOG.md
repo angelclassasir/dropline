@@ -2,6 +2,22 @@
 
 All notable changes to Dropline. Versions match `core/Cargo.toml`; the release ZIP is named from it.
 
+## 1.1.0
+
+Everything here came out of one question: *"why can't I use After Effects while it downloads?"* The answer was not one bug - it was a download that asked for 4K, an encoder that took every core, and a panel that could spend up to 900 ms asleep on AE's only thread.
+
+### Performance
+- **Downloads are capped at 1080p by default.** The old selector asked for the best stream available, which on YouTube means 4K: four to six times the bytes for the same picture on a 1080p comp. A 5-minute segment used to land as ~1 GB; it is now ~200 MB. Set `"maxHeight"` in `~/.dropline/config.json` if you want more (e.g. `2160`) or less.
+- **`--concurrent-fragments 4`**: YouTube throttles a single connection, so four in parallel make full downloads noticeably faster.
+- **Trim re-encodes are two to three times faster** (`-preset veryfast -crf 20` instead of `-preset fast -crf 18`). Visually indistinguishable at 1080p, and it is the step that used to keep the CPU busy for a minute.
+- **The core runs at below-normal priority.** yt-dlp and ffmpeg inherit it, so they use idle cores and After Effects keeps the foreground - including during an encode.
+- **`status.json` is now published atomically** (temp file + rename) and throttled to a few updates per second instead of one per progress line. Two threads writing the same file could previously produce a half-written JSON and a lost tick.
+- **The panel reads status at most every 750 ms, only when the file actually changed, and never sleeps in the poll.** The old path retried a busy read with `$.sleep(300)` up to three times: up to 900 ms of frozen editor, per tick.
+- **Killing leftover processes moved into the launcher** (`wscript` runs `taskkill` off AE's thread). The click cost went from 682 ms to 319 ms.
+
+### Measured inside After Effects
+With a 60 s trimmed YouTube download (41 s wall clock, imported as a 60 s layer): a 200 ms heartbeat on AE's main thread recorded **161 beats, worst gap 627 ms** (the import itself), everything else at ~200 ms. Before these changes the same job stalled the editor for the whole download.
+
 ## 1.0.4
 
 ### Fixed

@@ -16,11 +16,34 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ===== process priority =====
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    fn SetPriorityClass(process: *mut core::ffi::c_void, priority_class: u32) -> i32;
+}
+
+/// Drop to BELOW_NORMAL_PRIORITY_CLASS. Declared by hand because it is the only
+/// Win32 call the core needs, and a whole windows-sys dependency for one function
+/// is not worth it.
+#[cfg(windows)]
+fn run_below_normal_priority() {
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    unsafe {
+        SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    }
+}
+
+#[cfg(not(windows))]
+fn run_below_normal_priority() {}
 
 #[derive(Clone, Debug, Default)]
 struct Job {
@@ -52,9 +75,20 @@ impl Job {
 struct Status {
     folder: PathBuf,
     job: String,
+    /// The stdout and stderr reader threads both publish progress, so exactly one
+    /// of them may touch status.json at a time.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl Status {
+    fn new(folder: PathBuf, job: String) -> Self {
+        Status {
+            folder,
+            job,
+            write_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
     fn write(&self, state: &str, percent: f64, message: &str, file: Option<&str>) {
         let payload = json!({
             "version": VERSION,
@@ -63,8 +97,16 @@ impl Status {
             "percent": percent,
             "message": message,
             "file": file
-        });
-        let _ = fs::write(self.folder.join("status.json"), payload.to_string());
+        })
+        .to_string();
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Write then rename: a reader (the panel) can never catch a half-written
+        // file, which used to surface as an occasional "bad JSON" and a lost tick.
+        let target = self.folder.join("status.json");
+        let temp = self.folder.join("status.json.tmp");
+        if fs::write(&temp, payload).is_ok() {
+            let _ = fs::rename(&temp, &target);
+        }
     }
 }
 
@@ -468,10 +510,7 @@ fn run_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let status = Status {
-        folder: folder.clone(),
-        job: job.job.clone(),
-    };
+    let status = Status::new(folder.clone(), job.job.clone());
 
     if job.url.is_empty() {
         status.write("error", 0.0, "Missing video URL", None);
@@ -514,6 +553,14 @@ fn run_cli(args: &[String]) -> i32 {
         .arg("--restrict-filenames")
         .arg("--no-playlist")
         .arg("--newline")
+        // YouTube throttles one fragment connection at a time; four in parallel is
+        // the sweet spot before the server starts dropping them.
+        .arg("--concurrent-fragments")
+        .arg("4")
+        .arg("--retries")
+        .arg("5")
+        .arg("--fragment-retries")
+        .arg("20")
         .arg("--merge-output-format")
         .arg("mp4")
         .arg("-o")
@@ -528,7 +575,18 @@ fn run_cli(args: &[String]) -> i32 {
             .arg("--audio-quality")
             .arg("0");
     } else {
-        cmd.arg("-f").arg("bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/b");
+        // 1080p H.264 is what a timeline needs. Asking for "best" pulls 4K: four
+        // times the bytes and the same picture on a 1080p comp. Override with
+        // "maxHeight" in ~/.dropline/config.json if you really want more.
+        let max_height = cfg
+            .get("maxHeight")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1080)
+            .clamp(360, 4320);
+        cmd.arg("-f").arg(format!(
+            "bv*[vcodec^=avc1][height<={h}]+ba[ext=m4a]/b[ext=mp4][height<={h}]/b",
+            h = max_height
+        ));
     }
     if job.has_trim() {
         cmd.arg("--download-sections")
@@ -540,7 +598,7 @@ fn run_cli(args: &[String]) -> i32 {
                 .arg("ExtractAudio:-c:a aac -b:a 192k");
         } else {
             cmd.arg("--postprocessor-args")
-                .arg("ffmpeg:-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -c:a aac -b:a 192k");
+                .arg("ffmpeg:-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k");
         }
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -565,6 +623,11 @@ fn run_cli(args: &[String]) -> i32 {
     let sh_out = Arc::clone(&shared);
     let t_out = thread::spawn(move || {
         let reader = BufReader::new(stdout);
+        // yt-dlp prints a progress line many times a second. Publishing every one
+        // meant dozens of file writes per second, which the panel then had to read
+        // on AE's main thread. Three updates per second is plenty.
+        let mut last_pct = -1.0f64;
+        let mut last_at = Instant::now() - Duration::from_secs(1);
         for line in reader.lines().flatten() {
             if line.contains("[Merger]") || line.contains("[Fixup]") || line.contains("[ExtractAudio]") {
                 let pct = sh_out.lock().unwrap().0;
@@ -575,7 +638,11 @@ fn run_cli(args: &[String]) -> i32 {
                     guard.0 = pct;
                     guard.1 = "downloading".to_string();
                 }
-                st_out.write("downloading", pct, &line, None);
+                if (pct - last_pct).abs() >= 1.0 || last_at.elapsed() >= Duration::from_millis(350) {
+                    st_out.write("downloading", pct, &line, None);
+                    last_pct = pct;
+                    last_at = Instant::now();
+                }
             }
         }
     });
@@ -584,6 +651,8 @@ fn run_cli(args: &[String]) -> i32 {
     let sh_err = Arc::clone(&shared);
     let t_err = thread::spawn(move || {
         let reader = BufReader::new(stderr);
+        let mut last_pct = -1.0f64;
+        let mut last_at = Instant::now() - Duration::from_secs(1);
         for line in reader.lines().flatten() {
             let mut guard = sh_err.lock().unwrap();
             guard.2.push(line.clone());
@@ -594,7 +663,11 @@ fn run_cli(args: &[String]) -> i32 {
             if let Some(pct) = parse_percent(&line) {
                 guard.0 = pct;
                 drop(guard);
-                st_err.write(&state, pct, &line, None);
+                if (pct - last_pct).abs() >= 1.0 || last_at.elapsed() >= Duration::from_millis(350) {
+                    st_err.write(&state, pct, &line, None);
+                    last_pct = pct;
+                    last_at = Instant::now();
+                }
             }
         }
     });
@@ -650,10 +723,7 @@ fn run_update() -> i32 {
             return 1;
         }
     };
-    let status = Status {
-        folder,
-        job: String::new(),
-    };
+    let status = Status::new(folder, String::new());
     let ytdlp = resolve_ytdlp(&job, &cfg);
 
     status.write("updating", 0.0, "Updating yt-dlp...", None);
@@ -690,6 +760,10 @@ fn print_usage() {
 }
 
 fn main() {
+    // A download or a re-encode must never take the machine away from the editor:
+    // below-normal priority still uses every idle core, but After Effects (and the
+    // rest of the desktop) keeps the foreground. yt-dlp and ffmpeg inherit it.
+    run_below_normal_priority();
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(|s| s.as_str()) {
         Some("cli") => run_cli(&args[2..]),

@@ -1,4 +1,4 @@
-// Dropline panel v1.0.4 - After Effects ScriptUI panel
+// Dropline panel v1.1.0 - After Effects ScriptUI panel
 //
 // The URL never touches the command line: it travels inside request.json and the
 // core reads it from there, so there is nothing to escape or inject. Progress
@@ -19,7 +19,7 @@ if (!String.prototype.trim) {
 }
 
 (function (thisObj) {
-    var PANEL_VERSION = "1.0.4";
+    var PANEL_VERSION = "1.1.0";
 
     var HOME = (function () {
         try { return Folder.userData.parent.parent.fsName; } catch (e) {}
@@ -287,7 +287,7 @@ if (!String.prototype.trim) {
     consoleCard.spacing = 6;
     consoleCard.margins = 12;
     surface(consoleCard, "surface");
-    var progressText = consoleCard.add("statictext", undefined, "░░░░░░░░░░░░  0%");
+    var progressText = consoleCard.add("statictext", undefined, "????????????????????????????????????  0%");
     paint(progressText, "accent", "12px Consolas");
     var statusText = consoleCard.add("statictext", undefined, "ready to drop");
     paint(statusText, "text", "10px Segoe UI");
@@ -315,17 +315,13 @@ if (!String.prototype.trim) {
     function blocks(pct) {
         var filled = Math.round(pct / 100 * 12);
         var out = "";
-        for (var i = 0; i < 12; i++) out += (i < filled) ? "█" : "░";
+        for (var i = 0; i < 12; i++) out += (i < filled) ? "???" : "???";
         return out;
     }
 
-    // Cleanup WITHOUT blind ffmpeg kill (that could leave half-locked files)
+    // File cleanup only. Killing leftover processes is the launcher's job: doing it
+    // here through system.callSystem froze the editor for ~0.5 s on every click.
     function aggressiveCleanup() {
-        try {
-            system.callSystem('cmd /c taskkill /im dropline-core.exe /f >nul 2>&1');
-            system.callSystem('cmd /c taskkill /im yt-dlp.exe /f >nul 2>&1');
-        } catch (e) {}
-        $.sleep(400);
         try {
             var junk = ["/status.json", "/callproof.txt", "/request.json"];
             for (var i = 0; i < junk.length; i++) {
@@ -340,6 +336,8 @@ if (!String.prototype.trim) {
                 }
             }
         } catch (e) {}
+        lastStatusKey = "";
+        lastStatusData = null;
     }
 
     function writeRequest(fields) {
@@ -368,7 +366,15 @@ if (!String.prototype.trim) {
     // AE's pipe survives, and wscript exits at once. Measured inside AE: 278 ms to EOF
     // while the core downloaded the clip to completion.
     function writeLauncher(arguments) {
-        var text = 'CreateObject("WScript.Shell").Run """' + CFG.exeWin + '"" ' + arguments + '", 0, False\r\n';
+        // The kill of any leftover core/yt-dlp happens in the launcher, not in AE:
+        // taskkill inside callSystem blocked the editor for ~0.5 s on every click.
+        // WScript waits for it (True) in its own hidden console while AE carries on.
+        var text = 'Dim sh\r\n' +
+                   'Set sh = CreateObject("WScript.Shell")\r\n' +
+                   'On Error Resume Next\r\n' +
+                   'sh.Run "cmd /c taskkill /im dropline-core.exe /f /im yt-dlp.exe /f >nul 2>&1", 0, True\r\n' +
+                   'On Error Goto 0\r\n' +
+                   'sh.Run """' + CFG.exeWin + '"" ' + arguments + '", 0, False\r\n';
         var file = new File(CFG.launcher);
         if (!file.open("w")) throw new Error("cannot write " + CFG.launcher);
         file.write(text);
@@ -393,26 +399,40 @@ if (!String.prototype.trim) {
         } catch (e) {}
     }
 
+    // Reading status.json on AE's main thread must be cheap: the tick runs a few
+    // times a second. So there is no retry loop here (a $.sleep would freeze the
+    // editor), and the file is only parsed when its size or timestamp changed. The
+    // core publishes atomically (temp file + rename), so a half-written JSON is now
+    // impossible rather than merely unlikely.
+    var lastStatusKey = "";
+    var lastStatusData = null;
+
     function readStatus() {
         var file = new File(CFG.bridge + "/status.json");
-        if (!file.exists) return null;
+        if (!file.exists) {
+            lastStatusKey = "";
+            return null;
+        }
+        var key = file.length + ":" + file.modified.getTime();
+        if (key === lastStatusKey) return lastStatusData;
+
         var data = null;
-        var retries = 0;
-        while (retries < 3) {
-            try {
-                file.encoding = "UTF-8";
-                file.open("r");
+        try {
+            file.encoding = "UTF-8";
+            if (file.open("r")) {
                 var text = file.read();
                 file.close();
                 data = parseJSON(text);
-                if (data && data.state) break; // success
-            } catch (e) {
-                try { file.close(); } catch (e2) {}
-                retries++;
-                if (retries < 3) $.sleep(300); // wait before retry
             }
+        } catch (e) {
+            try { file.close(); } catch (e2) {}
         }
-        return (data && data.state) ? data : null;
+        if (data && data.state) {
+            lastStatusKey = key;
+            lastStatusData = data;
+            return data;
+        }
+        return lastStatusData; // keep the last good snapshot instead of losing a tick
     }
 
     function unlock() {
@@ -448,7 +468,7 @@ if (!String.prototype.trim) {
         try {
             // $.global is explicit on purpose: scheduleTask evaluates the string in the
             // app-wide scope, and the panel's locals live in its closure.
-            watch.taskId = app.scheduleTask("$.global.__droplinePoll && $.global.__droplinePoll();", 500, true);
+            watch.taskId = app.scheduleTask("$.global.__droplinePoll && $.global.__droplinePoll();", 750, true);
             log("WATCH STARTED job=" + watch.job + " task=" + watch.taskId);
         } catch (e) {
             log("SCHEDULETASK FAILED " + e.toString());
@@ -589,11 +609,13 @@ if (!String.prototype.trim) {
         var videoFile = new File(filePath);
         if (!videoFile.exists) { setStatus("file not found: " + filePath, "err"); log("IMPORT FAIL: missing " + filePath); return; }
         var prev = -1;
-        for (var k = 0; k < 10; k++) {
+        // The core writes status "done" only after the file is complete, so this is
+        // just insurance: a few short checks, never the old 10 x 400 ms stall.
+        for (var k = 0; k < 4; k++) {
             var cur = videoFile.length;
             if (cur > 0 && cur === prev) break;
             prev = cur;
-            $.sleep(400);
+            if (k < 3) $.sleep(250);
         }
         if (prev <= 0) { setStatus("downloaded file is empty", "err"); paintStep(s3, "err"); log("IMPORT FAIL: empty file"); return; }
         var comp = app.project.activeItem;
@@ -788,7 +810,7 @@ if (!String.prototype.trim) {
         }
     };
 
-    setDebug((CFG.configured ? "core OK" : "run install.ps1") + " · v" + PANEL_VERSION, "muted");
+    setDebug((CFG.configured ? "core OK" : "run install.ps1") + " ?? v" + PANEL_VERSION, "muted");
     log("PANEL LOADED v" + PANEL_VERSION);
 
     if (pal instanceof Window) {
